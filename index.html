@@ -573,7 +573,8 @@ class PPU {
         const bgP = !!(sp.at & 0x80), yFlip = !!(sp.at & 0x40), xFlip = !!(sp.at & 0x20);
         const pal = (sp.at & 0x10) ? this.OBP1 : this.OBP0;
         let sY = ly - sp.sy; if (yFlip) sY = (objSz-1) - sY;
-        let tIdx = sp.ti; if (objSz === 16) tIdx &= 0xFE;
+        let tIdx = sp.ti;
+        if (objSz === 16) { tIdx &= 0xFE; if (sY >= 8) { tIdx++; sY -= 8; } }
         const tAddr = tIdx*16 + sY*2;
         let bit = 7 - (x - sp.sx); if (xFlip) bit = 7-bit;
         const lo = vram0[tAddr], hi = vram0[tAddr+1];
@@ -589,108 +590,179 @@ class PPU {
 
   // ---- GBC scanline ----
   _renderScanlineGBC(ly) {
-    const lcdc = this.LCDC;
-    const bgEn  = !!(lcdc & 0x01); // In GBC mode this also controls bg/win priority
-    const objEn = !!(lcdc & 0x02);
-    const objSz = (lcdc & 0x04) ? 16 : 8;
+    const lcdc   = this.LCDC;
+    const masterBgEn = !!(lcdc & 0x01); // GBC: 0=OBJ always on top of BG/WIN
+    const objEn  = !!(lcdc & 0x02);
+    const objSz  = (lcdc & 0x04) ? 16 : 8;
     const bgMap  = (lcdc & 0x08) ? 0x1C00 : 0x1800;
     const signed = !(lcdc & 0x10);
     const winEn  = !!(lcdc & 0x20);
     const winMap = (lcdc & 0x40) ? 0x1C00 : 0x1800;
 
     const vram0 = this.vram[0];
-    const vram1 = this.vram[1]; // tile attributes
+    const vram1 = this.vram[1]; // tile attributes (GBC bank 1)
 
-    // bg color buffer: [r,g,b] per pixel, and bg-priority flag
-    const bgColors = new Array(SCREEN_W).fill(null).map(() => [0,0,0]);
-    const bgPrioPx = new Uint8Array(SCREEN_W); // BG-over-OBJ priority bit from attr
+    // Per-pixel BG color (packed RGBA) and priority flag
+    const bgColorR = new Uint8Array(SCREEN_W);
+    const bgColorG = new Uint8Array(SCREEN_W);
+    const bgColorB = new Uint8Array(SCREEN_W);
+    // bgPrioPx[x]: bit0=BG-over-OBJ attr set AND shade!=0, bit1=shade is non-zero
+    const bgPrioPx = new Uint8Array(SCREEN_W);
 
-    const drawTileLine = (pixX, tileY, tileRow, tileCol, mapBase, forWindow) => {
-      const mapAddr = mapBase + tileRow*32 + tileCol;
-      const tileNum = vram0[mapAddr];
-      const attr    = vram1[mapAddr]; // GBC tile attributes
-      const palIdx  = attr & 0x07;
-      const vramBnk = (attr >> 3) & 0x01;
-      const xFlip   = !!(attr & 0x20);
-      const yFlip   = !!(attr & 0x40);
-      const bgObjPr = !!(attr & 0x80);
-
-      let tAddr;
-      if (signed) tAddr = 0x1000 + ((tileNum << 24) >> 24)*16;
-      else        tAddr = tileNum * 16;
-
-      let row = tileY & 7; if (yFlip) row = 7 - row;
-      const lo = this.vram[vramBnk][tAddr + row*2];
-      const hi = this.vram[vramBnk][tAddr + row*2 + 1];
-
-      let bx = xFlip ? (pixX & 7) : 7 - (pixX & 7);
-      const shade = (((hi >> bx)&1) << 1) | ((lo >> bx)&1);
-      const col = this._bgPal[palIdx][shade];
-      const px  = forWindow ? pixX : pixX;
-      bgColors[px] = col;
-      bgPrioPx[px] = (bgObjPr && shade !== 0) ? 1 : 0;
-    };
-
-    if (bgEn || this.gb.isGBC) {
+    // ---- BG ----
+    // When LCDC.0=0 in GBC: BG/WIN rendered as palette0[color0], OBJ always wins
+    if (!masterBgEn) {
+      const c0 = this._bgPal[0][0];
+      for (let x = 0; x < SCREEN_W; x++) {
+        bgColorR[x] = c0[0]; bgColorG[x] = c0[1]; bgColorB[x] = c0[2];
+        bgPrioPx[x] = 0;
+      }
+    } else {
       const scy = this.SCY, scx = this.SCX;
       const y   = (ly + scy) & 0xFF;
-      for (let x = 0; x < SCREEN_W; x++) {
-        const sx = (x + scx) & 0xFF;
-        drawTileLine(x, y, (y>>3)&31, (sx>>3)&31, bgMap, false);
-      }
-    }
+      const tileRowBase = ((y >> 3) & 31) * 32;
+      const fineY = y & 7;
 
+      for (let x = 0; x < SCREEN_W; x++) {
+        const sx      = (x + scx) & 0xFF;
+        const tileCol = (sx >> 3) & 31;
+        const mapAddr = bgMap + tileRowBase + tileCol;
+
+        const tileNum  = vram0[mapAddr];
+        const attr     = vram1[mapAddr];
+        const palIdx   = attr & 0x07;
+        const vbnk     = (attr >> 3) & 0x01;
+        const xFlip    = !!(attr & 0x20);
+        const yFlip    = !!(attr & 0x40);
+        const bgObjPri = !!(attr & 0x80);
+
+        const tAddr = signed
+          ? 0x1000 + (((tileNum << 24) >> 24) * 16)
+          : tileNum * 16;
+
+        const row  = yFlip ? (7 - fineY) : fineY;
+        const lo   = this.vram[vbnk][tAddr + row * 2];
+        const hi   = this.vram[vbnk][tAddr + row * 2 + 1];
+        const fineX = sx & 7;
+        const bitPos = xFlip ? fineX : (7 - fineX);
+        const shade  = (((hi >> bitPos) & 1) << 1) | ((lo >> bitPos) & 1);
+
+        const col = this._bgPal[palIdx][shade];
+        bgColorR[x] = col[0];
+        bgColorG[x] = col[1];
+        bgColorB[x] = col[2];
+        // bit0 = bg-priority attribute AND shade!=0 (blocks sprites)
+        // bit1 = shade!=0 (for dmg-style priority when masterBgEn=0)
+        bgPrioPx[x] = (shade !== 0 ? 2 : 0) | (bgObjPri && shade !== 0 ? 1 : 0);
+      }
+    } // end else (masterBgEn)
+
+    // ---- Window ----
     if (winEn && ly >= this.WY) {
       const wx = this.WX - 7;
       if (wx < SCREEN_W) {
         const wy = this.windowLine;
+        const tileRowBase = ((wy >> 3) & 31) * 32;
+        const fineY = wy & 7;
+
         for (let x = Math.max(0, wx); x < SCREEN_W; x++) {
-          const winX = x - wx;
-          drawTileLine(x, wy, (wy>>3)&31, (winX>>3)&31, winMap, true);
+          const winX    = x - wx;
+          const tileCol = (winX >> 3) & 31;
+          const mapAddr = winMap + tileRowBase + tileCol;
+
+          const tileNum  = vram0[mapAddr];
+          const attr     = vram1[mapAddr];
+          const palIdx   = attr & 0x07;
+          const vbnk     = (attr >> 3) & 0x01;
+          const xFlip    = !!(attr & 0x20);
+          const yFlip    = !!(attr & 0x40);
+          const bgObjPri = !!(attr & 0x80);
+
+          const tAddr = signed
+            ? 0x1000 + (((tileNum << 24) >> 24) * 16)
+            : tileNum * 16;
+
+          const row    = yFlip ? (7 - fineY) : fineY;
+          const lo     = this.vram[vbnk][tAddr + row * 2];
+          const hi     = this.vram[vbnk][tAddr + row * 2 + 1];
+          const fineX  = winX & 7;
+          const bitPos = xFlip ? fineX : (7 - fineX);
+          const shade  = (((hi >> bitPos) & 1) << 1) | ((lo >> bitPos) & 1);
+
+          const col = this._bgPal[palIdx][shade];
+          bgColorR[x] = col[0];
+          bgColorG[x] = col[1];
+          bgColorB[x] = col[2];
+          bgPrioPx[x] = (shade !== 0 ? 2 : 0) | (bgObjPri && shade !== 0 ? 1 : 0);
         }
         this.windowLine++;
       }
     }
 
-    // Sprites
+    // ---- Sprites ----
+    // GBC: OAM index order is priority (lower index = higher priority), no X-sort
     const sprites = [];
     if (objEn) {
-      for (let i = 0; i < 40 && sprites.length < 10; i++) {
-        const b = i*4;
-        const sy = this.oam[b]-16, sx = this.oam[b+1]-8;
-        if (ly >= sy && ly < sy+objSz)
-          sprites.push({sy, sx, ti: this.oam[b+2], at: this.oam[b+3]});
+      for (let i = 0; i < 40; i++) {
+        const b  = i * 4;
+        const sy = this.oam[b] - 16;
+        const sx = this.oam[b + 1] - 8;
+        if (ly >= sy && ly < sy + objSz) {
+          sprites.push({ sy, sx, ti: this.oam[b + 2], at: this.oam[b + 3] });
+          if (sprites.length === 10) break;
+        }
       }
-      sprites.sort((a,b) => a.sx - b.sx);
+      // GBC uses OAM index order (already correct), but still stable-sort by X for DMG compat
+      // Actually in GBC mode lower OAM index wins — no sort needed, already in order
     }
 
+    // ---- Compose ----
     const base = ly * SCREEN_W;
     for (let x = 0; x < SCREEN_W; x++) {
-      let col = bgColors[x];
+      let r = bgColorR[x], g = bgColorG[x], b = bgColorB[x];
 
+      spriteLoop:
       for (let s = 0; s < sprites.length; s++) {
         const sp = sprites[s];
-        if (x < sp.sx || x >= sp.sx+8) continue;
-        const bgP  = !!(sp.at & 0x80);
-        const yFlp = !!(sp.at & 0x40);
-        const xFlp = !!(sp.at & 0x20);
-        const palIdx = (sp.at & 0x07);
-        let sY = ly - sp.sy; if (yFlp) sY = (objSz-1)-sY;
-        let tIdx = sp.ti; if (objSz === 16) tIdx &= 0xFE;
-        const vbnk = (sp.at >> 3) & 0x01;
-        const tAddr = tIdx*16 + sY*2;
-        let bit = 7 - (x - sp.sx); if (xFlp) bit = 7 - bit;
-        const lo = this.vram[vbnk][tAddr], hi = this.vram[vbnk][tAddr+1];
-        const spShade = (((hi >> bit)&1) << 1) | ((lo >> bit)&1);
-        if (spShade === 0) continue;
-        // GBC priority: bgPrioPx wins if set (unless LCDC bit0=0)
-        if (bgP && bgPrioPx[x] && bgEn) continue;
-        col = this._objPal[palIdx][spShade];
-        break;
+        if (x < sp.sx || x >= sp.sx + 8) continue;
+
+        const bgP    = !!(sp.at & 0x80);
+        const yFlp   = !!(sp.at & 0x40);
+        const xFlp   = !!(sp.at & 0x20);
+        const vbnk   = (sp.at >> 3) & 0x01;
+        const palIdx = sp.at & 0x07;
+
+        let sY   = ly - sp.sy;
+        if (yFlp) sY = (objSz - 1) - sY;
+        let tIdx = sp.ti;
+        if (objSz === 16) { tIdx &= 0xFE; if (sY >= 8) { tIdx++; sY -= 8; } }
+
+        const tAddr  = tIdx * 16 + sY * 2;
+        const fineX  = x - sp.sx;
+        const bitPos = xFlp ? fineX : (7 - fineX);
+        const lo     = this.vram[vbnk][tAddr];
+        const hi     = this.vram[vbnk][tAddr + 1];
+        const spShade = (((hi >> bitPos) & 1) << 1) | ((lo >> bitPos) & 1);
+
+        if (spShade === 0) continue; // transparent
+
+        // Priority rules (GBC):
+        // - If LCDC bit0=0: OBJ always wins over BG/WIN
+        // - If OBJ attr bit7=1 (bgP): BG/WIN color 1-3 win; color 0 loses
+        // - If BG attr bit7=1 (bgPrioPx bit0): BG/WIN wins if shade!=0
+        if (masterBgEn) {
+          // BG tile attr priority bit overrides everything (if BG shade != 0)
+          if (bgPrioPx[x] & 1) continue; // bg-priority attr set AND shade!=0: BG wins
+          // OBJ attr bit7: sprite is behind BG color 1-3
+          if (bgP && (bgPrioPx[x] & 2)) continue; // sprite behind non-zero BG
+        }
+
+        const sc = this._objPal[palIdx][spShade];
+        r = sc[0]; g = sc[1]; b = sc[2];
+        break spriteLoop;
       }
 
-      const [r,g,b] = col;
-      this.framebuffer[base+x] = ((r<<24)|(g<<16)|(b<<8)|0xFF) >>> 0;
+      this.framebuffer[base + x] = ((r << 24) | (g << 16) | (b << 8) | 0xFF) >>> 0;
     }
   }
 }
@@ -1452,10 +1524,10 @@ class GameBoy {
     this.ppu.bgPalData.fill(0xFF); this.ppu.objPalData.fill(0xFF);
     for(let p=0;p<8;p++){this.ppu._parseBgPal(p);this.ppu._parseObjPal(p);}
 
-    this.cpu.A = gbc ? 0x11 : 0x01; this.cpu.F = 0xB0;
-    this.cpu.B = 0x00; this.cpu.C = 0x13;
-    this.cpu.D = 0x00; this.cpu.E = gbc ? 0x08 : 0xD8;
-    this.cpu.H = 0x01; this.cpu.L = 0x4D;
+    this.cpu.A = gbc ? 0x11 : 0x01; this.cpu.F = gbc ? 0x80 : 0xB0;
+    this.cpu.B = 0x00; this.cpu.C = gbc ? 0x00 : 0x13;
+    this.cpu.D = gbc ? 0xFF : 0x00; this.cpu.E = gbc ? 0x56 : 0xD8;
+    this.cpu.H = gbc ? 0x00 : 0x01; this.cpu.L = gbc ? 0x0D : 0x4D;
     this.cpu.SP = 0xFFFE;
     this.cpu.PC = 0x0100;
     this.cpu.IME = false; this.cpu.IMESchedule = 0; this.cpu.halted = false;
